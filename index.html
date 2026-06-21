@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>AR 实时飘雪交互体验 (极速启动版)</title>
+  
+  <!-- 使用国内高速镜像 CDN 引入 MediaPipe，大幅减少首屏载入延迟 -->
+  <script src="https://npm.elemecdn.com/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://npm.elemecdn.com/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://npm.elemecdn.com/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
+
+  <!-- Three.js Import Map (同步使用国内高速 CDN 镜像) -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://npm.elemecdn.com/three@0.160.0/build/three.module.js"
+      }
+    }
+  </script>
+
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #050a12;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 10;
+    }
+
+    #loading {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(10, 15, 30, 0.85); /* 降低透明度，让用户隐约看到后面的 3D 飘雪 */
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 1000;
+      transition: opacity 0.5s ease;
+      backdrop-filter: blur(5px);
+    }
+    
+    .loader {
+      border: 4px solid rgba(255, 255, 255, 0.1);
+      width: 50px;
+      height: 50px;
+      border-radius: 50%;
+      border-left-color: #00d2ff;
+      animation: spin 1s linear infinite;
+    }
+    
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    
+    .loading-text {
+      color: #fff;
+      font-family: sans-serif;
+      font-size: 18px;
+      margin-top: 20px;
+      font-weight: 300;
+    }
+    
+    .loading-subtext {
+      color: #aaa;
+      font-family: sans-serif;
+      font-size: 13px;
+      margin-top: 8px;
+    }
+
+    #instructions {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.65);
+      color: #fff;
+      padding: 10px 20px;
+      border-radius: 20px;
+      font-family: sans-serif;
+      z-index: 100;
+      font-size: 13px;
+      pointer-events: none;
+      text-align: center;
+      line-height: 1.6;
+      max-width: 90%;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    }
+
+    #fps-counter {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(0, 0, 0, 0.6);
+      color: #00ffcc;
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-family: monospace;
+      z-index: 100;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="loading">
+    <div class="loader"></div>
+    <div class="loading-text" id="loading-status">正在准备 3D 渲染...</div>
+    <div class="loading-subtext">使用国内高速镜像，预计 2-5 秒内完成初始化</div>
+  </div>
+
+  <div id="fps-counter">FPS: 00</div>
+
+  <div id="instructions">
+    ❄️ <b>飘雪手势交互体验 (优化版)</b> ❄️<br>
+    1. <b>摊开手掌</b>：承接并堆积雪花 | 2. <b>双手靠近揉搓</b>：卷起雪球<br>
+    3. <b>快速向前推</b>：将雪球扔向屏幕粘附！
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    // ==========================================
+    // 1. 初始化性能与自适应尺寸
+    // ==========================================
+    const isMobile = window.innerWidth < 768;
+    const camWidth = isMobile ? 360 : 640;  // 降低摄像头分辨率减少传输耗时
+    const camHeight = isMobile ? 270 : 480;
+    
+    const maxSnowflakes = isMobile ? 96 : 120;
+    const maxBodySnow = isMobile ? 480 : 600;
+    const maxPalmSnow = isMobile ? 120 : 150;
+    const maxDecals = 5;
+
+    const handsInterval = 2;
+    const selfieInterval = isMobile ? 6 : 4;
+
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+
+    // ==========================================
+    // 2. 初始化 Three.js 场景与渲染
+    // ==========================================
+    const scene = new THREE.Scene();
+    
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0, 30);
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.body.appendChild(renderer.domElement);
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.85);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(5, 15, 10);
+    scene.add(dirLight);
+
+    // ==========================================
+    // 3. 画布纹理动态生成
+    // ==========================================
+    function createSnowflakeTexture() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 32;
+      canvas.height = 32;
+      const ctx = canvas.getContext('2d');
+      const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+      grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+      grad.addColorStop(0.5, 'rgba(255, 255, 255, 0.7)');
+      grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 32, 32);
+      return new THREE.CanvasTexture(canvas);
+    }
+    const snowTexture = createSnowflakeTexture();
+
+    function createSplatTexture() {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128;
+      canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, 128, 128);
+      
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      const numStreaks = 6 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < numStreaks; i++) {
+        const angle = (i / numStreaks) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
+        const len = 35 + Math.random() * 20;
+        ctx.beginPath();
+        ctx.moveTo(64, 64);
+        const cpX = 64 + Math.cos(angle) * (len * 0.5) + (Math.random() - 0.5) * 8;
+        const cpY = 64 + Math.sin(angle) * (len * 0.5) + (Math.random() - 0.5) * 8;
+        const targetX = 64 + Math.cos(angle) * len;
+        const targetY = 64 + Math.sin(angle) * len;
+        ctx.quadraticCurveTo(cpX, cpY, targetX, targetY);
+        ctx.stroke();
+      }
+      
+      const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 32);
+      grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+      grad.addColorStop(0.6, 'rgba(255, 255, 255, 0.9)');
+      grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(64, 64, 32, 0, Math.PI * 2);
+      ctx.fill();
+
+      const highlight = ctx.createRadialGradient(54, 54, 1, 64, 64, 24);
+      highlight.addColorStop(0, 'rgba(255, 255, 255, 1)');
+      highlight.addColorStop(0.8, 'rgba(215, 225, 235, 0.95)');
+      highlight.addColorStop(1, 'rgba(190, 200, 210, 0)');
+      ctx.fillStyle = highlight;
+      ctx.beginPath();
+      ctx.arc(64, 64, 24, 0, Math.PI * 2);
+      ctx.fill();
+      
+      return new THREE.CanvasTexture(canvas);
+    }
+
+    // ==========================================
+    // 4. 粒子及交互系统初始化
+    // ==========================================
+    let bgMesh, videoTexture;
+    function initVideoBackground() {
+      videoTexture = new THREE.VideoTexture(video);
+      videoTexture.colorSpace = THREE.SRGBColorSpace;
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      
+      const distance = 80;
+      const aspect = window.innerWidth / window.innerHeight;
+      const fovRad = (camera.fov * Math.PI) / 180;
+      const height = 2 * Math.tan(fovRad / 2) * distance;
+      const width = height * aspect;
+      
+      const bgGeometry = new THREE.PlaneGeometry(width, height);
+      const bgMaterial = new THREE.MeshBasicMaterial({ map: videoTexture, depthWrite: false });
+      bgMesh = new THREE.Mesh(bgGeometry, bgMaterial);
+      bgMesh.position.z = -distance;
+      scene.add(bgMesh);
+      
+      updateVideoAspect();
+    }
+
+    const snowGeometry = new THREE.BufferGeometry();
+    const snowPositions = new Float32Array(maxSnowflakes * 3);
+    const snowVelocities = [];
+    const snowSwayPhase = new Float32Array(maxSnowflakes);
+    const snowSwaySpeed = new Float32Array(maxSnowflakes);
+
+    function initSnowSystem() {
+      for (let i = 0; i < maxSnowflakes; i++) {
+        resetSnowflake(i);
+        snowPositions[i * 3 + 1] = Math.random() * 60 - 30;
+      }
+      snowGeometry.setAttribute('position', new THREE.BufferAttribute(snowPositions, 3));
+      const snowMaterial = new THREE.PointsMaterial({
+        size: 1.2,
+        map: snowTexture,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.NormalBlending
+      });
+      const snowPoints = new THREE.Points(snowGeometry, snowMaterial);
+      scene.add(snowPoints);
+    }
+
+    function resetSnowflake(i) {
+      snowPositions[i * 3] = (Math.random() - 0.5) * 50; 
+      snowPositions[i * 3 + 1] = 25; 
+      snowPositions[i * 3 + 2] = Math.random() * 20 + 5; 
+      
+      snowVelocities[i] = {
+        x: (Math.random() - 0.5) * 1.5,
+        y: -(Math.random() * 3.0 + 2.0),
+        z: (Math.random() - 0.5) * 1.5
+      };
+      snowSwayPhase[i] = Math.random() * Math.PI * 2;
+      snowSwaySpeed[i] = Math.random() * 2.0 + 1.0;
+    }
+
+    const bodySnowGeometry = new THREE.BufferGeometry();
+    const bodySnowPositions = new Float32Array(maxBodySnow * 3);
+    for (let i = 0; i < maxBodySnow; i++) {
+      bodySnowPositions[i * 3] = 9999;
+      bodySnowPositions[i * 3 + 1] = 9999;
+      bodySnowPositions[i * 3 + 2] = 9999;
+    }
+    bodySnowGeometry.setAttribute('position', new THREE.BufferAttribute(bodySnowPositions, 3));
+    const bodySnowMaterial = new THREE.PointsMaterial({
+      size: 0.8,
+      map: snowTexture,
+      transparent: true,
+      opacity: 0.9,
+      depthWrite: false
+    });
+    const bodySnowPoints = new THREE.Points(bodySnowGeometry, bodySnowMaterial);
+    scene.add(bodySnowPoints);
+
+    let bodySnowIndex = 0;
+    function addBodySnow(x, y, z) {
+      const positions = bodySnowGeometry.attributes.position.array;
+      positions[bodySnowIndex * 3] = x;
+      positions[bodySnowIndex * 3 + 1] = y;
+      positions[bodySnowIndex * 3 + 2] = z;
+      bodySnowIndex = (bodySnowIndex + 1) % maxBodySnow;
+    }
+
+    const palmSnowGeometry = new THREE.BufferGeometry();
+    const palmSnowPositions = new Float32Array(maxPalmSnow * 3);
+    const palmSnowOffsets = [];
+    for (let i = 0; i < maxPalmSnow; i++) {
+      palmSnowPositions[i * 3] = 9999;
+      palmSnowPositions[i * 3 + 1] = 9999;
+      palmSnowPositions[i * 3 + 2] = 9999;
+      palmSnowOffsets.push({ x: 0, y: 0, z: 0 });
+    }
+    palmSnowGeometry.setAttribute('position', new THREE.BufferAttribute(palmSnowPositions, 3));
+    const palmSnowMaterial = new THREE.PointsMaterial({
+      size: 0.7,
+      map: snowTexture,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false
+    });
+    const palmSnowPoints = new THREE.Points(palmSnowGeometry, palmSnowMaterial);
+    scene.add(palmSnowPoints);
+
+    let palmSnowIndex = 0;
+    function addPalmSnow(palmCenter) {
+      const positions = palmSnowGeometry.attributes.position.array;
+      for (let k = 0; k < 2; k++) {
+        const idx = palmSnowIndex;
+        const radius = 1.0;
+        const angle = Math.random() * Math.PI * 2;
+        const r = Math.random() * radius;
+        
+        palmSnowOffsets[idx] = {
+          x: Math.cos(angle) * r,
+          y: (Math.random() - 0.2) * 0.3,
+          z: Math.sin(angle) * r
+        };
+        
+        positions[idx * 3] = palmCenter.x + palmSnowOffsets[idx].x;
+        positions[idx * 3 + 1] = palmCenter.y + palmSnowOffsets[idx].y;
+        positions[idx * 3 + 2] = palmCenter.z + palmSnowOffsets[idx].z;
+        
+        palmSnowIndex = (palmSnowIndex + 1) % maxPalmSnow;
+      }
+    }
+
+    const ballGeo = new THREE.SphereGeometry(1, 32, 16);
+    const ballMat = new THREE.MeshToonMaterial({
+      color: 0xf0f5ff,
+      roughness: 0.9,
+      metalness: 0.1
+    });
+    const snowballMesh = new THREE.Mesh(ballGeo, ballMat);
+    snowballMesh.visible = false;
+    scene.add(snowballMesh);
+
+    const flyingSnowballMesh = snowballMesh.clone();
+    flyingSnowballMesh.visible = false;
+    scene.add(flyingSnowballMesh);
+
+    const decalGeometry = new THREE.PlaneGeometry(5.5, 5.5);
+    const decalPool = [];
+    const activeDecals = [];
+    
+    for (let i = 0; i < maxDecals; i++) {
+      const tex = createSplatTexture();
+      const mat = new THREE.MeshBasicMaterial({
+        map: tex,
+        transparent: true,
+        depthWrite: false,
+        depthTest: false
+      });
+      const mesh = new THREE.Mesh(decalGeometry, mat);
+      mesh.visible = false;
+      scene.add(mesh);
+      decalPool.push(mesh);
+    }
+    
+    let nextDecalIndex = 0;
+    function triggerSplat(x, y) {
+      const mesh = decalPool[nextDecalIndex];
+      mesh.position.set(x, y, 28.5); 
+      mesh.scale.set(0.01, 0.01, 0.01);
+      mesh.visible = true;
+      
+      const targetScale = 1.0 + Math.random() * 0.3;
+      const existing = activeDecals.find(d => d.mesh === mesh);
+      if (existing) {
+        existing.timeElapsed = 0;
+        existing.targetScale = targetScale;
+        existing.active = true;
+      } else {
+        activeDecals.push({
+          mesh: mesh,
+          timeElapsed: 0,
+          targetScale: targetScale,
+          active: true
+        });
+      }
+      nextDecalIndex = (nextDecalIndex + 1) % maxDecals;
+    }
+
+    // ==========================================
+    // 5. MediaPipe AI 数据处理及采样
+    // ==========================================
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = 64;
+    maskCanvas.height = 48;
+    const maskCtx = maskCanvas.getContext('2d');
+    let maskData = null;
+
+    function updateMaskCanvas(results) {
+      maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+      maskCtx.save();
+      maskCtx.translate(maskCanvas.width, 0);
+      maskCtx.scale(-1, 1);
+      maskCtx.drawImage(results.segmentationMask, 0, 0, maskCanvas.width, maskCanvas.height);
+      maskCtx.restore();
+      
+      maskData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
+    }
+
+    const tempV3 = new THREE.Vector3();
+    function checkCollisionWithBody(x, y, z) {
+      if (!maskData) return false;
+      tempV3.set(x, y, z);
+      tempV3.project(camera);
+      
+      if (tempV3.x < -1 || tempV3.x > 1 || tempV3.y < -1 || tempV3.y > 1) return false;
+      
+      const px = Math.floor((tempV3.x + 1) * 0.5 * maskCanvas.width);
+      const py = Math.floor((1 - tempV3.y) * 0.5 * maskCanvas.height);
+      
+      if (px >= 0 && px < maskCanvas.width && py >= 0 && py < maskCanvas.height) {
+        const idx = (py * maskCanvas.width + px) * 4;
+        const alpha = maskData[idx];
+        return alpha > 120;
+      }
+      return false;
+    }
+
+    function dist2D(p1, p2) {
+      if (!p1 || !p2) return 999;
+      const dx = p1.x - p2.x;
+      const dy = p1.y - p2.y;
+      return Math.sqrt(dx*dx + dy*dy);
+    }
+
+    function getHandWorldPos(landmark) {
+      // 矫正深度，支持拉伸映射
+      const zDepth = 15 - (landmark.z * 30);
+      
+      const ndc_x = (1 - landmark.x) * 2 - 1;
+      const ndc_y = (1 - landmark.y) * 2 - 1;
+      
+      const vector = new THREE.Vector3(ndc_x, ndc_y, 0.5);
+      vector.unproject(camera);
+      
+      const dir = vector.sub(camera.position).normalize();
+      const distToPlane = (zDepth - camera.position.z) / dir.z;
+      return camera.position.clone().add(dir.multiplyScalar(distToPlane));
+    }
+
+    function isOpenPalm(hand) {
+      const wrist = hand[0];
+      
+      const isExtended = (tip, pip) => {
+        return dist2D(hand[tip], wrist) > dist2D(hand[pip], wrist) * 1.05;
+      };
+      
+      const indexExt = isExtended(8, 6);
+      const middleExt = isExtended(12, 10);
+      const ringExt = isExtended(16, 14);
+      const pinkyExt = isExtended(20, 18);
+      
+      const thumbExt = dist2D(hand[4], hand[5]) > dist2D(hand[2], hand[5]) * 1.1;
+      
+      let openCount = 0;
+      if (indexExt) openCount++;
+      if (middleExt) openCount++;
+      if (ringExt) openCount++;
+      if (pinkyExt) openCount++;
+      if (thumbExt) openCount++;
+      
+      return openCount >= 4; 
+    }
+
+    // ==========================================
+    // 6. 状态机与物理学模拟
+    // ==========================================
+    let isRolling = false;
+    let snowballRadius = 0.01;
+    const maxSnowballRadius = 1.3;
+    const snowballPosition = new THREE.Vector3();
+    
+    const lastLeftHandPos = new THREE.Vector3();
+    const lastRightHandPos = new THREE.Vector3();
+
+    let isThrown = false;
+    const flyingSnowballPos = new THREE.Vector3();
+    let flyingSnowballRadius = 0.1;
+    const thrownVelocity = new THREE.Vector3();
+
+    let activePalmCenter = null;
+    let leftHand = null;
+    let rightHand = null;
+
+    function onHandsResults(results) {
+      if (!isHandsReady) { isHandsReady = true; checkReady(); }
+      leftHand = null;
+      rightHand = null;
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+          const landmarks = results.multiHandLandmarks[i];
+          const label = results.multiHandedness[i].label;
+          if (label === "Left") leftHand = landmarks;
+          else rightHand = landmarks;
+        }
+      }
+    }
+
+    function onSelfieResults(results) {
+      if (!isSelfieReady) { isSelfieReady = true; checkReady(); }
+      updateMaskCanvas(results);
+    }
+
+    function updateSnow(dt) {
+      const positions = snowGeometry.attributes.position.array;
+      for (let i = 0; i < maxSnowflakes; i++) {
+        const vel = snowVelocities[i];
+        snowSwayPhase[i] += snowSwaySpeed[i] * dt;
+        const sway = Math.sin(snowSwayPhase[i]) * 1.4;
+        
+        positions[i * 3] += (vel.x + sway) * dt;
+        positions[i * 3 + 1] += vel.y * dt;
+        positions[i * 3 + 2] += vel.z * dt;
+        
+        const collision = checkCollisionWithBody(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
+        if (collision) {
+          addBodySnow(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
+          resetSnowflake(i);
+          continue;
+        }
+
+        if (positions[i * 3 + 1] < -25) {
+          resetSnowflake(i);
+        }
+      }
+      snowGeometry.attributes.position.needsUpdate = true;
+    }
+
+    function updateBodySnow(dt) {
+      const positions = bodySnowGeometry.attributes.position.array;
+      for (let i = 0; i < maxBodySnow; i++) {
+        if (positions[i * 3] === 9999) continue;
+        
+        const x = positions[i * 3];
+        const y = positions[i * 3 + 1];
+        const z = positions[i * 3 + 2];
+        
+        const onBody = checkCollisionWithBody(x, y, z);
+        if (!onBody) {
+          positions[i * 3 + 1] -= 6.0 * dt;
+          positions[i * 3] += (Math.random() - 0.5) * 2.0 * dt;
+          
+          if (positions[i * 3 + 1] < -25) {
+            positions[i * 3] = 9999;
+            positions[i * 3 + 1] = 9999;
+            positions[i * 3 + 2] = 9999;
+          }
+        } else {
+          positions[i * 3 + 1] -= 0.15 * dt;
+        }
+      }
+      bodySnowGeometry.attributes.position.needsUpdate = true;
+    }
+
+    function updatePalmSnow(dt) {
+      const positions = palmSnowGeometry.attributes.position.array;
+      for (let i = 0; i < maxPalmSnow; i++) {
+        if (positions[i * 3] === 9999) continue;
+        
+        if (activePalmCenter) {
+          positions[i * 3] = activePalmCenter.x + palmSnowOffsets[i].x;
+          positions[i * 3 + 1] = activePalmCenter.y + palmSnowOffsets[i].y;
+          positions[i * 3 + 2] = activePalmCenter.z + palmSnowOffsets[i].z;
+        } else {
+          positions[i * 3 + 1] -= 7.0 * dt;
+          if (positions[i * 3 + 1] < -25) {
+            positions[i * 3] = 9999;
+            positions[i * 3 + 1] = 9999;
+            positions[i * 3 + 2] = 9999;
+          }
+        }
+      }
+      palmSnowGeometry.attributes.position.needsUpdate = true;
+    }
+
+    function updateHandInteractions(dt) {
+      activePalmCenter = null;
+      let leftPalmWorld = null;
+      let rightPalmWorld = null;
+      
+      if (leftHand) {
+        leftPalmWorld = getHandWorldPos(leftHand[9]);
+        if (lastLeftHandPos.lengthSq() === 0) lastLeftHandPos.copy(leftPalmWorld);
+      }
+      if (rightHand) {
+        rightPalmWorld = getHandWorldPos(rightHand[9]);
+        if (lastRightHandPos.lengthSq() === 0) lastRightHandPos.copy(rightPalmWorld);
+      }
+
+      // 1. 摊手检测
+      let hasPalm = false;
+      if (leftHand && isOpenPalm(leftHand)) {
+        activePalmCenter = leftPalmWorld;
+        hasPalm = true;
+      } else if (rightHand && isOpenPalm(rightHand)) {
+        activePalmCenter = rightPalmWorld;
+        hasPalm = true;
+      }
+
+      if (hasPalm && activePalmCenter) {
+        addPalmSnow(activePalmCenter);
+      }
+      updatePalmSnow(dt);
+
+      // 2. 卷雪球检测
+      if (leftHand && rightHand) {
+        const d2d = dist2D(leftHand[9], rightHand[9]); 
+        if (d2d < 0.22) { 
+          if (!isRolling && !isThrown) {
+            isRolling = true;
+            snowballMesh.visible = true;
+            snowballRadius = 0.15;
+          }
+          
+          if (isRolling && leftPalmWorld && rightPalmWorld) {
+            const midpoint = new THREE.Vector3().addVectors(leftPalmWorld, rightPalmWorld).multiplyScalar(0.5);
+            const ballVel = midpoint.clone().sub(snowballMesh.position).divideScalar(dt);
+            snowballMesh.position.copy(midpoint);
+            
+            const vLeft = leftPalmWorld.distanceTo(lastLeftHandPos) / dt;
+            const vRight = rightPalmWorld.distanceTo(lastRightHandPos) / dt;
+            if (vLeft > 1.0 || vRight > 1.0) {
+              snowballRadius = Math.min(maxSnowballRadius, snowballRadius + 0.4 * dt);
+            }
+            snowballMesh.scale.setScalar(snowballRadius);
+
+            // 3. 投掷检测
+            if (ballVel.z > 15.0 && snowballRadius > 0.35) {
+              isThrown = true;
+              isRolling = false;
+              snowballMesh.visible = false;
+              
+              flyingSnowballPos.copy(snowballMesh.position);
+              flyingSnowballRadius = snowballRadius;
+              thrownVelocity.copy(ballVel);
+              
+              if (thrownVelocity.z < 8.0) thrownVelocity.z = 20.0; 
+            }
+          }
+        } else {
+          if (isRolling) {
+            isRolling = false;
+            snowballMesh.visible = false;
+            snowballRadius = 0.01;
+          }
+        }
+      } else {
+        if (isRolling) {
+          isRolling = false;
+          snowballMesh.visible = false;
+          snowballRadius = 0.01;
+        }
+      }
+
+      if (leftPalmWorld) lastLeftHandPos.copy(leftPalmWorld);
+      if (rightPalmWorld) lastRightHandPos.copy(rightPalmWorld);
+
+      // 4. 飞行雪球
+      if (isThrown) {
+        flyingSnowballPos.x += thrownVelocity.x * dt;
+        flyingSnowballPos.y += thrownVelocity.y * dt;
+        flyingSnowballPos.z += thrownVelocity.z * dt;
+        
+        thrownVelocity.y -= 14.0 * dt; 
+        
+        flyingSnowballMesh.position.copy(flyingSnowballPos);
+        flyingSnowballMesh.scale.setScalar(flyingSnowballRadius);
+        flyingSnowballMesh.visible = true;
+
+        if (flyingSnowballPos.z >= 28.5) {
+          const splatX = THREE.MathUtils.clamp(flyingSnowballPos.x, -12, 12);
+          const splatY = THREE.MathUtils.clamp(flyingSnowballPos.y, -9, 9);
+          
+          triggerSplat(splatX, splatY);
+          isThrown = false;
+          flyingSnowballMesh.visible = false;
+        }
+
+        if (flyingSnowballPos.z > 35 || flyingSnowballPos.y < -20) {
+          isThrown = false;
+          flyingSnowballMesh.visible = false;
+        }
+      }
+    }
+
+    function updateDecals(dt) {
+      for (let d of activeDecals) {
+        if (!d.active) continue;
+        d.timeElapsed += dt;
+        const t = d.timeElapsed / 0.3;
+        if (t <= 1.0) {
+          const scale = d.targetScale * (Math.sin(t * Math.PI * 1.8) * Math.exp(-t * 2.5) + 1.0);
+          d.mesh.scale.setScalar(scale);
+        } else {
+          d.mesh.scale.setScalar(d.targetScale);
+        }
+      }
+    }
+
+    // ==========================================
+    // 7. 渲染帧与网络资源流处理
+    // ==========================================
+    let isHandsReady = false;
+    let isSelfieReady = false;
+    let isHandsProcessing = false;
+    let isSelfieProcessing = false;
+    let frameCount = 0;
+
+    function tickMediaPipe() {
+      frameCount++;
+      if (video.readyState >= 2) {
+        if (frameCount % handsInterval === 0 && !isHandsProcessing) {
+          isHandsProcessing = true;
+          hands.send({ image: video }).then(() => { isHandsProcessing = false; });
+        }
+        if (frameCount % selfieInterval === 0 && !isSelfieProcessing) {
+          isSelfieProcessing = true;
+          selfieSegmentation.send({ image: video }).then(() => { isSelfieProcessing = false; });
+        }
+      }
+    }
+
+    const statusText = document.getElementById('loading-status');
+    function updateStatus(text) {
+      if (statusText) statusText.textContent = text;
+    }
+
+    function checkReady() {
+      if (isHandsReady && isSelfieReady) {
+        const overlay = document.getElementById('loading');
+        overlay.style.opacity = '0';
+        setTimeout(() => {
+          overlay.style.display = 'none';
+        }, 500);
+      }
+    }
+
+    let lastTime = 0;
+    let lastFpsTime = 0;
+    let fpsFrames = 0;
+    const fpsDiv = document.getElementById('fps-counter');
+
+    function animate(time) {
+      requestAnimationFrame(animate);
+
+      const dt = Math.min((time - lastTime) / 1000, 0.1); 
+      lastTime = time;
+
+      fpsFrames++;
+      if (time - lastFpsTime >= 1000) {
+        const fps = Math.round((fpsFrames * 1000) / (time - lastFpsTime));
+        fpsDiv.textContent = `FPS: ${fps}`;
+        fpsFrames = 0;
+        lastFpsTime = time;
+      }
+
+      tickMediaPipe();
+
+      updateSnow(dt);
+      updateBodySnow(dt);
+      updateHandInteractions(dt);
+      updateDecals(dt);
+
+      renderer.render(scene, camera);
+    }
+
+    // ==========================================
+    // 8. 窗口尺寸及裁剪计算
+    // ==========================================
+    function updateVideoAspect() {
+      if (!videoTexture || !video.videoWidth) return;
+      
+      const videoAspect = video.videoWidth / video.videoHeight;
+      const screenAspect = window.innerWidth / window.innerHeight;
+      
+      let repeatX = 1;
+      let repeatY = 1;
+      let offsetX = 0;
+      let offsetY = 0;
+
+      if (screenAspect > videoAspect) {
+        repeatY = videoAspect / screenAspect;
+        offsetY = (1 - repeatY) / 2;
+      } else {
+        repeatX = screenAspect / videoAspect;
+        offsetX = (1 - repeatX) / 2;
+      }
+      
+      videoTexture.repeat.set(-repeatX, repeatY);
+      videoTexture.offset.set(offsetX + repeatX, offsetY);
+    }
+
+    window.addEventListener('resize', () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      
+      renderer.setSize(w, h);
+      
+      if (bgMesh) {
+        const distance = 80;
+        const fovRad = (camera.fov * Math.PI) / 180;
+        const height = 2 * Math.tan(fovRad / 2) * distance;
+        const width = height * camera.aspect;
+        
+        bgMesh.geometry.dispose();
+        bgMesh.geometry = new THREE.PlaneGeometry(width, height);
+      }
+      updateVideoAspect();
+    });
+
+    // ==========================================
+    // 9. 多通道异步拉取启动 (优化核心)
+    // ==========================================
+    async function setupCamera() {
+      // 降低分辨率规范并移除过于苛刻的高画质限制，实现秒级摄像头唤醒
+      const constraints = {
+        video: {
+          width: isMobile ? 360 : 640,
+          height: isMobile ? 270 : 480,
+          facingMode: "user"
+        },
+        audio: false
+      };
+      
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        return new Promise((resolve) => {
+          video.onloadedmetadata = () => {
+            video.play();
+            resolve();
+          };
+        });
+      } catch (err) {
+        console.warn("标准视频模式打开失败，尝试基础后备方案...", err);
+        // 若标准自适应报错，则降级为最基础配置以跳过硬件检测耗时
+        try {
+          const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          video.srcObject = fallbackStream;
+          return new Promise((resolve) => {
+            video.onloadedmetadata = () => {
+              video.play();
+              resolve();
+            };
+          });
+        } catch (fallbackErr) {
+          alert("无法访问您的摄像头设备，请检查权限设置。");
+          throw fallbackErr;
+        }
+      }
+    }
+
+    async function setupMediaPipe() {
+      // 实例化 Hands 工具并使用 Lite 极速模型（0 级复杂度）
+      window.hands = new Hands({
+        locateFile: (file) => `https://npm.elemecdn.com/@mediapipe/hands/${file}`
+      });
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 0, // 0对应Lite极速模型，相较于1(Full)模型文件体积减少60%以上
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      hands.onResults(onHandsResults);
+
+      // 实例化 SelfieSegmentation 极速人体分割模型
+      window.selfieSegmentation = new SelfieSegmentation({
+        locateFile: (file) => `https://npm.elemecdn.com/@mediapipe/selfie_segmentation/${file}`
+      });
+      selfieSegmentation.setOptions({ modelSelection: 0 }); // 选用高效的通用模型
+      selfieSegmentation.onResults(onSelfieResults);
+    }
+
+    async function start() {
+      // Step A: 启动 3D 渲染，用户在第一秒即可看到飘雪效果，完全解决“首屏纯黑”痛点
+      initSnowSystem();
+      requestAnimationFrame(animate);
+
+      // Step B: 并行异步调用相机和加载神经网络，实现零等待、多路并发加载
+      try {
+        updateStatus("正在唤醒前置相机...");
+        await setupCamera();
+        initVideoBackground(); // 相机启动后将背景图材质平铺
+        
+        updateStatus("正在加速下载 AI 视觉模型...");
+        await setupMediaPipe();
+        
+        updateStatus("正在启动神经网络引擎...");
+        // 首帧推理触发后，checkReady() 将自动淡出加载蒙层
+      } catch (err) {
+        updateStatus("初始化失败，请重试或检查网络");
+        console.error("并发初始化出错:", err);
+      }
+    }
+
+    start();
+  </script>
+</body>
+</html>
